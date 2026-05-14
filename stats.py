@@ -12,7 +12,7 @@ async def get_top_text(period: str = "all", limit: int = 10) -> str:
     """Generate top users leaderboard text."""
     users = await db.get_top_users(limit)
     if not users:
-        return "📊 Статистика пуста — сначала нужно поучаствовать в блице!"
+        return "📊 Статистика пуста - сначала нужно поучаствовать в блице!"
 
     period_labels = {
         "day": "📅 Топ дня",
@@ -32,7 +32,7 @@ async def get_top_text(period: str = "all", limit: int = 10) -> str:
         xp = u["xp"]
         correct = u["correct_answers"]
         lines.append(
-            f"{medal} {uname} — {level_emoji} <b>{level_name}</b>\n"
+            f"{medal} {uname} - {level_emoji} <b>{level_name}</b>\n"
             f"    XP: <b>{xp}</b> · ✅ Правильных: {correct}"
         )
 
