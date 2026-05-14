@@ -64,7 +64,7 @@ AUTO_BLITZ_OPTIONS = {
 # Daily fact time (hour, minute) in UTC
 DAILY_FACT_TIME = (7, 0)
 
-# Bad words (base list — extend via DB)
+# Bad words (base list - extend via DB)
 BAD_WORDS_RU = [
     "блять", "бля", "блядь", "блядина",
     "ёбаный", "ёб", "еб", "ебать", "ебал", "ебать",
@@ -73,7 +73,7 @@ BAD_WORDS_RU = [
     "залупа", "мудак", "мудила", "мудозвон",
     "пидор", "пидар", "пидорас",
     "сука", "суки", "сучка",
-    "блин",  # mild — optional
+    "блин",  # mild - optional
     "нахуй", "нахер", "нахрен",
     "ёпта", "епта",
     "ёпт",
