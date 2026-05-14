@@ -1,232 +1,273 @@
+"""
+admin_panel.py - панель управления для владельца и администраторов.
+- Владелец управляет через ЛС
+- Админы тоже получают меню (только свои кнопки)
+- Логи всех действий → владельцу
+"""
+
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
 
 import database as db
 from config import OWNER_ID, MAIN_CHAT_ID
 from moderation import (
-    restrict_user, unrestrict_user, ban_user_tg, kick_user,
-    apply_restrict_duration
+    restrict_user, unrestrict_user, ban_user_tg, kick_user, unban_user_tg,
+    apply_restrict_duration,
 )
-from utils import get_level_info, parse_duration, format_duration
+from utils import get_level_info, parse_duration, format_duration, now_str
 
 logger = logging.getLogger(__name__)
 
-# Track owner's pending state: {owner_id: {"state": str, "data": dict}}
-_owner_state: dict[int, dict] = {}
+# owner state machine: {user_id: {state, data}}
+_states: dict[int, dict] = {}
 
+def set_state(user_id: int, state: str, data: dict = None):
+    _states[user_id] = {"state": state, "data": data or {}}
 
-def set_owner_state(state: str, data: dict = None):
-    _owner_state[OWNER_ID] = {"state": state, "data": data or {}}
+def get_state(user_id: int) -> dict:
+    return _states.get(user_id, {"state": None, "data": {}})
 
-
-def get_owner_state() -> dict:
-    return _owner_state.get(OWNER_ID, {"state": None, "data": {}})
-
-
-def clear_owner_state():
-    _owner_state.pop(OWNER_ID, None)
+def clear_state(user_id: int):
+    _states.pop(user_id, None)
 
 
 # ══════════════════════════════════════════════════════════════════
-# MAIN MENU
+# MENUS
 # ══════════════════════════════════════════════════════════════════
 
-def main_menu_keyboard():
+def owner_menu_keyboard():
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⚙️ Настройки",   callback_data="admin:settings"),
-            InlineKeyboardButton("📜 Правила",      callback_data="admin:rules"),
-        ],
-        [
-            InlineKeyboardButton("👋 Приветствие",  callback_data="admin:welcome"),
-            InlineKeyboardButton("🛡 Безопасность", callback_data="admin:security"),
-        ],
-        [
-            InlineKeyboardButton("📢 Канал",        callback_data="admin:channel"),
-            InlineKeyboardButton("👮 Модераторы",   callback_data="admin:mods"),
-        ],
-        [
-            InlineKeyboardButton("📚 Книги",        callback_data="admin:books"),
-            InlineKeyboardButton("🧠 ИИ-история",   callback_data="admin:ai"),
-        ],
-        [
-            InlineKeyboardButton("📊 Статистика",   callback_data="admin:stats"),
-            InlineKeyboardButton("🚫 Банлист",      callback_data="admin:banlist"),
-        ],
-        [
-            InlineKeyboardButton("⚡ Блиц старт",   callback_data="admin:blitz_start"),
-            InlineKeyboardButton("🛑 Блиц стоп",    callback_data="admin:blitz_stop"),
-        ],
+        [InlineKeyboardButton("⚙️ Настройки",     callback_data="ap:settings"),
+         InlineKeyboardButton("📜 Правила",        callback_data="ap:rules")],
+        [InlineKeyboardButton("👋 Приветствие",    callback_data="ap:welcome"),
+         InlineKeyboardButton("🛡 Безопасность",   callback_data="ap:security")],
+        [InlineKeyboardButton("📢 Канал",          callback_data="ap:channel"),
+         InlineKeyboardButton("👑 Управление адм", callback_data="ap:admins")],
+        [InlineKeyboardButton("📚 Книги",          callback_data="ap:books"),
+         InlineKeyboardButton("🧠 ИИ-история",     callback_data="ap:ai")],
+        [InlineKeyboardButton("📊 Статистика",     callback_data="ap:stats"),
+         InlineKeyboardButton("🚫 Банлист",        callback_data="ap:banlist")],
+        [InlineKeyboardButton("📜 Логи действий",  callback_data="ap:logs"),
+         InlineKeyboardButton("⚡ Блиц старт",     callback_data="ap:blitz_start")],
     ])
 
 
-async def send_main_menu(bot: Bot, chat_id: int):
-    await bot.send_message(
-        chat_id,
-        "⚙️ <b>Панель управления Касым-ботом</b>\n\n"
-        "Выберите раздел для настройки:",
-        parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
-    )
+def admin_menu_keyboard():
+    """Menu for non-owner admins."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👮 Нарушения",   callback_data="ap:violations"),
+         InlineKeyboardButton("📊 Статистика",  callback_data="ap:stats")],
+        [InlineKeyboardButton("🚫 Банлист",     callback_data="ap:banlist"),
+         InlineKeyboardButton("⚡ Блиц старт",  callback_data="ap:blitz_start")],
+        [InlineKeyboardButton("🛑 Блиц стоп",   callback_data="ap:blitz_stop")],
+    ])
+
+
+async def send_menu(bot: Bot, user_id: int):
+    if user_id == OWNER_ID:
+        kb   = owner_menu_keyboard()
+        text = "👑 <b>Панель владельца - Касым</b>\n\nВыберите раздел:"
+    else:
+        kb   = admin_menu_keyboard()
+        text = "👮 <b>Панель администратора - Касым</b>\n\nВыберите действие:"
+    await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=kb)
 
 
 # ══════════════════════════════════════════════════════════════════
-# HANDLE OWNER TEXT IN DM
+# HANDLE OWNER/ADMIN DM TEXT
 # ══════════════════════════════════════════════════════════════════
 
-async def handle_owner_dm(update: Update, bot: Bot) -> bool:
-    """
-    Handle owner's DM commands.
-    Returns True if handled.
-    """
-    msg = update.message
+async def handle_admin_dm(update: Update, bot: Bot) -> bool:
+    """Handle text commands in DM from owner or admin. Returns True if handled."""
+    msg  = update.message
     if not msg or not msg.text:
         return False
 
-    text = msg.text.strip()
-    state_info = get_owner_state()
-    state = state_info["state"]
-    data  = state_info["data"]
+    user_id = msg.from_user.id
+    is_owner = (user_id == OWNER_ID)
 
-    # ── Pending: restrict duration input ─────────────────────────
-    if state == "await_restrict_duration":
-        v_id = data.get("violation_id")
-        if v_id:
-            result = await apply_restrict_duration(bot, v_id, text)
-            await bot.send_message(OWNER_ID, result)
-            clear_owner_state()
-            return True
+    # Must be owner or admin
+    rank = await db.get_moderator_rank(user_id)
+    if not is_owner and rank == 0:
+        return False
 
-    # ── Pending: manual restrict on user ─────────────────────────
-    if state == "await_manual_restrict":
-        uid = data.get("user_id")
-        uname = data.get("username", "")
-        if uid:
-            td = parse_duration(text)
-            until = datetime.now() + td if td else None
-            await restrict_user(bot, uid, until=until)
-            dur = format_duration(td)
-            await bot.send_message(OWNER_ID, f"✅ Пользователь ограничен на {dur}.")
-            mention = f"@{uname}" if uname else f"id{uid}"
-            await bot.send_message(
-                MAIN_CHAT_ID,
-                f"🔇 {mention}, возможности в чате ограничены.\nСрок: <b>{dur}</b>",
-                parse_mode="HTML"
-            )
-            clear_owner_state()
-            return True
-
-    # ── Commands ─────────────────────────────────────────────────
+    text       = msg.text.strip()
     text_lower = text.lower()
 
-    # Show menu
-    if text_lower in ("меню", "панель", "помощь", "/start", "/menu"):
-        await send_main_menu(bot, OWNER_ID)
+    # ── Pending state handling ────────────────────────────────────
+    st = get_state(user_id)
+    if st["state"] == "await_restrict_duration":
+        v_id = st["data"].get("violation_id")
+        if v_id:
+            result = await apply_restrict_duration(bot, v_id, text)
+            await bot.send_message(user_id, result)
+            clear_state(user_id)
+            return True
+
+    # ── Menu triggers ─────────────────────────────────────────────
+    if text_lower in ("меню", "панель", "/start", "/menu", "помощь"):
+        await send_menu(bot, user_id)
         return True
+
+    # ── OWNER-ONLY commands ───────────────────────────────────────
+    if is_owner:
+        handled = await _owner_commands(bot, user_id, text, text_lower)
+        if handled:
+            return True
+
+    # ── SHARED commands (owner + admins) ──────────────────────────
+    return await _shared_commands(bot, user_id, text, text_lower)
+
+
+async def _owner_commands(bot, user_id, text, text_lower) -> bool:
+    """Commands only available to owner."""
 
     # +Правила
-    if text.startswith("+Правила") or text.startswith("+правила"):
-        rules = text.split("\n", 1)[1].strip() if "\n" in text else ""
-        if rules:
-            await db.set_setting("rules", rules)
-            await bot.send_message(OWNER_ID, "✅ Правила сохранены.")
+    if text_lower.startswith("+правила"):
+        body = text.split("\n", 1)[1].strip() if "\n" in text else ""
+        if body:
+            await db.set_setting("rules", body)
+            await bot.send_message(user_id, "✅ Правила сохранены.")
         else:
-            await bot.send_message(OWNER_ID, "Напишите правила после команды, на новой строке.")
+            await bot.send_message(user_id, "Напишите правила на новой строке после команды.")
         return True
 
-    # -Правила / Правила удалить
     if text_lower in ("-правила", "правила удалить"):
         await db.delete_setting("rules")
-        await bot.send_message(OWNER_ID, "✅ Правила удалены.")
+        await bot.send_message(user_id, "✅ Правила удалены.")
         return True
 
     # +Приветствие
-    if text.startswith("+Приветствие") or text.startswith("+приветствие"):
-        welcome = text.split("\n", 1)[1].strip() if "\n" in text else ""
-        if welcome:
-            await db.set_setting("welcome", welcome)
-            await bot.send_message(OWNER_ID, "✅ Приветствие сохранено.")
+    if text_lower.startswith("+приветствие"):
+        body = text.split("\n", 1)[1].strip() if "\n" in text else ""
+        if body:
+            await db.set_setting("welcome", body)
+            await bot.send_message(user_id, "✅ Приветствие сохранено.")
         else:
-            await bot.send_message(OWNER_ID, "Напишите приветствие после команды, на новой строке.")
+            await bot.send_message(user_id, "Напишите приветствие на новой строке.")
         return True
 
-    # -Приветствие
     if text_lower in ("-приветствие", "приветствие удалить"):
         await db.delete_setting("welcome")
-        await bot.send_message(OWNER_ID, "✅ Приветствие удалено.")
+        await bot.send_message(user_id, "✅ Приветствие удалено.")
         return True
 
-    # +Канал @channel
+    # +Канал
     m = re.match(r"\+канал\s+(@\S+)", text_lower)
     if m:
-        ch = m.group(1)
-        await db.set_setting("required_channel", ch)
-        await bot.send_message(OWNER_ID, f"✅ Канал подписки: {ch}")
+        await db.set_setting("required_channel", m.group(1))
+        await bot.send_message(user_id, f"✅ Канал подписки: {m.group(1)}")
         return True
-
-    # -Канал
     if text_lower == "-канал":
         await db.delete_setting("required_channel")
-        await bot.send_message(OWNER_ID, "✅ Канал подписки удалён.")
+        await bot.send_message(user_id, "✅ Канал удалён.")
         return True
 
-    # +Контакт @username
-    m = re.match(r"\+контакт\s+(@\S+)", text_lower)
-    if m:
-        contact = m.group(1)
-        await db.set_setting("contact", contact)
-        await bot.send_message(OWNER_ID, f"✅ Контакт установлен: {contact}")
-        return True
-
-    # +Проверка подписки / -Проверка подписки
+    # Проверка подписки
     if text_lower in ("+проверка подписки", "+проверка"):
         await db.set_setting("check_subscription", "1")
-        await bot.send_message(OWNER_ID, "✅ Проверка подписки включена.")
+        await bot.send_message(user_id, "✅ Проверка подписки включена.")
         return True
     if text_lower in ("-проверка подписки", "-проверка"):
         await db.set_setting("check_subscription", "0")
-        await bot.send_message(OWNER_ID, "✅ Проверка подписки выключена.")
+        await bot.send_message(user_id, "✅ Проверка подписки выключена.")
         return True
 
-    # +Ручной режим / -Ручной режим
+    # Режимы
     if text_lower in ("+ручной режим", "+ручной"):
         await db.set_setting("manual_mode", "1")
-        await bot.send_message(OWNER_ID, "✅ Ручной режим включён.")
+        await bot.send_message(user_id, "✅ Ручной режим включён.")
         return True
     if text_lower in ("-ручной режим", "-ручной"):
         await db.set_setting("manual_mode", "0")
-        await bot.send_message(OWNER_ID, "✅ Ручной режим выключён (авто).")
+        await bot.send_message(user_id, "✅ Авторежим включён.")
         return True
 
-    # +Автовикторина / -Автовикторина
+    # Авто-блиц
     m = re.match(r"\+автовикторина\s+(.+)", text_lower)
     if m:
-        interval_text = m.group(1).strip()
-        td = parse_duration(interval_text)
+        td = parse_duration(m.group(1).strip())
         if td:
             await db.set_setting("auto_blitz_interval", str(int(td.total_seconds())))
-            await bot.send_message(OWNER_ID,
-                f"✅ Авто-блиц включён: каждые {format_duration(td)}.")
+            await bot.send_message(user_id, f"✅ Авто-блиц: каждые {format_duration(td)}.")
         return True
     if text_lower == "-автовикторина":
         await db.delete_setting("auto_blitz_interval")
-        await bot.send_message(OWNER_ID, "✅ Авто-блиц выключен.")
+        await bot.send_message(user_id, "✅ Авто-блиц выключен.")
+        return True
+
+    # +Админ / +Модер
+    m = re.match(r"\+(админ|модер)\s*(\d?)\s*(.*)", text_lower)
+    if m:
+        rank = int(m.group(2)) if m.group(2) else 1
+        target_str = m.group(3).strip()
+        uid, uname, fname = await _resolve_user(target_str)
+        if uid:
+            await db.add_moderator(uid, uname, fname, rank)
+            await bot.send_message(user_id,
+                f"✅ @{uname or fname} назначен администратором, ранг {rank}.")
+        else:
+            await bot.send_message(user_id, "Пользователь не найден. Укажите @username или ID.")
+        return True
+
+    m = re.match(r"-(админ|модер)\s*(.*)", text_lower)
+    if m:
+        target_str = m.group(2).strip()
+        uid, uname, fname = await _resolve_user(target_str)
+        if uid:
+            await db.remove_moderator(uid)
+            await bot.send_message(user_id, f"✅ @{uname or fname} снят с роли администратора.")
+        else:
+            await bot.send_message(user_id, "Пользователь не найден.")
+        return True
+
+    # Список админов
+    if text_lower in ("админы", "модеры", "модераторы"):
+        mods = await db.get_all_moderators()
+        if not mods:
+            await bot.send_message(user_id, "👮 Администраторов нет.")
+        else:
+            lines = ["👮 <b>Администраторы:</b>\n"]
+            for m in mods:
+                uname = f"@{m['username']}" if m["username"] else m["full_name"]
+                lines.append(f"• {uname} - ранг {m['rank']}")
+            await bot.send_message(user_id, "\n".join(lines), parse_mode="HTML")
+        return True
+
+    # Логи
+    if text_lower in ("логи", "логи сегодня"):
+        today_only = "сегодня" in text_lower
+        logs = await db.get_logs(limit=20, today_only=today_only)
+        await _send_logs(bot, user_id, logs)
+        return True
+
+    m = re.match(r"логи (админа|пользователя)\s+(@?\S+)", text_lower)
+    if m:
+        target_str = m.group(2)
+        uid, _, _ = await _resolve_user(target_str)
+        if uid:
+            if "админа" in m.group(1):
+                logs = await db.get_logs(limit=20, admin_id=uid)
+            else:
+                logs = await db.get_logs(limit=20, target_id=uid)
+            await _send_logs(bot, user_id, logs)
+        else:
+            await bot.send_message(user_id, "Пользователь не найден.")
         return True
 
     # Банлист
     if text_lower == "банлист":
-        banlist = await db.get_banlist()
-        if not banlist:
-            await bot.send_message(OWNER_ID, "🚫 Банлист пуст.")
+        bl = await db.get_banlist()
+        if not bl:
+            await bot.send_message(user_id, "🚫 Банлист пуст.")
         else:
             lines = ["🚫 <b>Банлист:</b>\n"]
-            for b in banlist[:20]:
-                uname = f"@{b['username']}" if b["username"] else b["full_name"] or f"id{b['user_id']}"
-                lines.append(f"• {uname} — {b['reason'] or '?'}")
-            await bot.send_message(OWNER_ID, "\n".join(lines), parse_mode="HTML")
+            for b in bl[:20]:
+                u = f"@{b['username']}" if b["username"] else f"id{b['user_id']}"
+                lines.append(f"• {u} - {b['reason'] or '?'}")
+            await bot.send_message(user_id, "\n".join(lines), parse_mode="HTML")
         return True
 
     m = re.match(r"банлист добавить\s+(\d+)", text_lower)
@@ -234,96 +275,74 @@ async def handle_owner_dm(update: Update, bot: Bot) -> bool:
         uid = int(m.group(1))
         await db.ban_user(uid, "", f"id{uid}", "Добавлен вручную")
         await ban_user_tg(bot, uid)
-        await bot.send_message(OWNER_ID, f"✅ Пользователь {uid} добавлен в банлист.")
+        await bot.send_message(user_id, f"✅ id{uid} добавлен в банлист.")
         return True
 
     m = re.match(r"банлист удалить\s+(\d+)", text_lower)
     if m:
         uid = int(m.group(1))
         await db.unban_user(uid)
-        await bot.send_message(OWNER_ID, f"✅ Пользователь {uid} удалён из банлиста.")
+        await unban_user_tg(bot, uid)
+        await bot.send_message(user_id, f"✅ id{uid} удалён из банлиста.")
         return True
 
-    if text_lower == "банлист очистить":
-        import aiosqlite
-        async with aiosqlite.connect("kasym.db") as d:
-            await d.execute("DELETE FROM banlist")
-            await d.execute("UPDATE users SET is_banned=0, ban_reason=NULL")
-            await d.commit()
-        await bot.send_message(OWNER_ID, "✅ Банлист очищен.")
-        return True
-
-    # +Модер / +Модер 2..5
-    m = re.match(r"\+(модер|админ)\s*(\d?)\s+(.+)", text_lower)
-    if m:
-        rank = int(m.group(2)) if m.group(2) else 1
-        target_text = m.group(3).strip()
-        uid, uname, fname = await _resolve_user(target_text)
-        if uid:
-            await db.add_moderator(uid, uname, fname, rank)
-            await bot.send_message(OWNER_ID,
-                f"✅ {uname or fname} назначен модератором, ранг {rank}.")
-        else:
-            await bot.send_message(OWNER_ID, "Пользователь не найден. Укажите ID или @username.")
-        return True
-
-    m = re.match(r"-(модер|админ)\s+(.+)", text_lower)
-    if m:
-        target_text = m.group(2).strip()
-        uid, uname, fname = await _resolve_user(target_text)
-        if uid:
-            await db.remove_moderator(uid)
-            await bot.send_message(OWNER_ID, f"✅ {uname or fname} снят с роли модератора.")
-        else:
-            await bot.send_message(OWNER_ID, "Пользователь не найден.")
-        return True
-
-    # Warn limit
+    # Варн лимит
     m = re.match(r"варн лимит\s+(\d+)", text_lower)
     if m:
         await db.set_setting("warn_limit", m.group(1))
-        await bot.send_message(OWNER_ID, f"✅ Лимит предупреждений: {m.group(1)}.")
+        await bot.send_message(user_id, f"✅ Лимит предупреждений: {m.group(1)}.")
         return True
 
-    # Книги — list
+    # Книги
     if text_lower == "книги":
         books = await db.get_all_books()
         if not books:
-            await bot.send_message(OWNER_ID, "📚 Книг нет. Отправьте PDF, DOCX или TXT в ЛС.")
+            await bot.send_message(user_id, "📚 Книг нет. Отправьте PDF/DOCX/TXT в ЛС.")
         else:
-            lines = ["📚 <b>Загруженные книги:</b>\n"]
+            icons = {"ready": "✅", "processing": "⏳", "error": "❌", "scanned": "⚠️"}
+            lines = ["📚 <b>Книги:</b>\n"]
             for b in books:
-                status_icon = {"ready": "✅", "processing": "⏳",
-                                "error": "❌", "scanned": "⚠️"}.get(b["status"], "?")
-                lines.append(f"{status_icon} {b['id']}. {b['title']} — {b['page_count']} стр.")
-            await bot.send_message(OWNER_ID, "\n".join(lines), parse_mode="HTML")
+                lines.append(f"{icons.get(b['status'],'?')} {b['id']}. {b['title']} - {b['page_count']} стр.")
+            await bot.send_message(user_id, "\n".join(lines), parse_mode="HTML")
         return True
 
     m = re.match(r"книга удалить\s+(\d+)", text_lower)
     if m:
-        bid = int(m.group(1))
-        await db.delete_book(bid)
-        await bot.send_message(OWNER_ID, f"✅ Книга #{bid} удалена.")
-        return True
-
-    if text_lower == "книги очистить":
-        import aiosqlite
-        async with aiosqlite.connect("kasym.db") as d:
-            await d.execute("DELETE FROM book_chunks")
-            await d.execute("DELETE FROM books")
-            await d.execute("DELETE FROM blitz_questions")
-            await d.commit()
-        await bot.send_message(OWNER_ID, "✅ Все книги удалены.")
-        return True
-
-    # Статистика
-    if text_lower in ("статистика", "стат"):
-        from stats import get_chat_stats
-        text_stat = await get_chat_stats()
-        await bot.send_message(OWNER_ID, text_stat, parse_mode="HTML")
+        await db.delete_book(int(m.group(1)))
+        await bot.send_message(user_id, "✅ Книга удалена.")
         return True
 
     return False
+
+
+async def _shared_commands(bot, user_id, text, text_lower) -> bool:
+    """Commands available to all admins."""
+    if text_lower in ("статистика", "стат"):
+        from stats import get_chat_stats
+        await bot.send_message(user_id, await get_chat_stats(), parse_mode="HTML")
+        return True
+    return False
+
+
+async def _send_logs(bot, user_id: int, logs):
+    if not logs:
+        await bot.send_message(user_id, "📜 Логов нет.")
+        return
+    lines = ["📜 <b>Журнал действий:</b>\n"]
+    for lg in logs:
+        admin = f"@{lg['admin_username']}" if lg["admin_username"] else lg["admin_name"]
+        target = f"@{lg['target_username']}" if lg["target_username"] else f"id{lg['target_id']}"
+        dur = f" [{lg['duration']}]" if lg["duration"] else ""
+        dt = lg["created_at"][:16].replace("T", " ")
+        lines.append(
+            f"<b>{dt}</b> | {admin} → {target}\n"
+            f"  <i>{lg['action']}{dur}</i> - {lg['reason']}"
+        )
+    # Split if too long
+    text = "\n\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n\n...(обрезано)"
+    await bot.send_message(user_id, text, parse_mode="HTML")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -331,150 +350,158 @@ async def handle_owner_dm(update: Update, bot: Bot) -> bool:
 # ══════════════════════════════════════════════════════════════════
 
 async def handle_admin_callback(update: Update, bot: Bot) -> bool:
-    """Handle admin panel inline button callbacks."""
     query = update.callback_query
-    if not query or query.from_user.id != OWNER_ID:
+    if not query:
+        return False
+
+    user_id  = query.from_user.id
+    is_owner = user_id == OWNER_ID
+    rank     = await db.get_moderator_rank(user_id)
+    if not is_owner and rank == 0:
         return False
 
     data = query.data
+    if not data.startswith("ap:"):
+        return False
+
     await query.answer()
+    action = data[3:]
 
-    if data == "admin:settings":
-        manual = await db.get_setting("manual_mode", "1")
-        check_sub = await db.get_setting("check_subscription", "0")
-        warn_limit = await db.get_setting("warn_limit", "3")
-        text = (
-            f"⚙️ <b>Настройки чата</b>\n\n"
-            f"Ручной режим: {'✅ вкл' if manual=='1' else '❌ выкл'}\n"
-            f"Проверка подписки: {'✅ вкл' if check_sub=='1' else '❌ выкл'}\n"
-            f"Лимит варнов: {warn_limit}\n\n"
-            f"Команды:\n"
-            f"+Ручной режим / -Ручной режим\n"
-            f"+Проверка подписки / -Проверка подписки\n"
-            f"Варн лимит 3"
-        )
-        await query.edit_message_text(text, parse_mode="HTML",
-                                       reply_markup=_back_keyboard())
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="ap:back")]])
+
+    if action == "back":
+        kb = owner_menu_keyboard() if is_owner else admin_menu_keyboard()
+        title = "👑 <b>Панель владельца</b>" if is_owner else "👮 <b>Панель администратора</b>"
+        await query.edit_message_text(title + "\n\nВыберите раздел:",
+                                       parse_mode="HTML", reply_markup=kb)
         return True
 
-    if data == "admin:rules":
+    if action == "settings" and is_owner:
+        manual   = await db.get_setting("manual_mode", "1")
+        sub      = await db.get_setting("check_subscription", "0")
+        warn_lim = await db.get_setting("warn_limit", "3")
+        await query.edit_message_text(
+            f"⚙️ <b>Настройки</b>\n\n"
+            f"Ручной режим: {'✅' if manual=='1' else '❌'}\n"
+            f"Проверка подписки: {'✅' if sub=='1' else '❌'}\n"
+            f"Лимит варнов: {warn_lim}\n\n"
+            f"Команды:\n+Ручной режим / -Ручной режим\n"
+            f"+Проверка подписки / -Проверка\nВарн лимит 3",
+            parse_mode="HTML", reply_markup=back_kb
+        )
+        return True
+
+    if action == "rules" and is_owner:
         rules = await db.get_setting("rules", "")
-        text = (
-            f"📜 <b>Текущие правила:</b>\n\n{rules or '(не установлены)'}\n\n"
-            f"Чтобы изменить, отправьте:\n<code>+Правила\nТекст правил...</code>"
+        await query.edit_message_text(
+            f"📜 <b>Правила:</b>\n\n{rules or '(не установлены)'}\n\n"
+            f"Команда: <code>+Правила\nТекст...</code>",
+            parse_mode="HTML", reply_markup=back_kb
         )
-        await query.edit_message_text(text, parse_mode="HTML",
-                                       reply_markup=_back_keyboard())
         return True
 
-    if data == "admin:welcome":
-        welcome = await db.get_setting("welcome", "")
-        text = (
-            f"👋 <b>Приветствие:</b>\n\n{welcome or '(не установлено)'}\n\n"
-            f"Переменные: {{имя}}, {{ссылка}}\n"
-            f"Команда: <code>+Приветствие\nТекст...</code>"
-        )
-        await query.edit_message_text(text, parse_mode="HTML",
-                                       reply_markup=_back_keyboard())
-        return True
-
-    if data == "admin:books":
+    if action == "books" and is_owner:
         books = await db.get_all_books()
         if not books:
-            text = "📚 Книг нет.\n\nОтправьте мне PDF, DOCX или TXT файл в этот чат."
+            t = "📚 Книг нет. Отправьте PDF/DOCX/TXT в ЛС."
         else:
+            icons = {"ready": "✅", "processing": "⏳", "error": "❌", "scanned": "⚠️"}
             lines = ["📚 <b>Книги:</b>\n"]
             for b in books:
-                icon = {"ready": "✅", "processing": "⏳",
-                        "error": "❌", "scanned": "⚠️"}.get(b["status"], "?")
-                lines.append(f"{icon} {b['id']}. {b['title']} — {b['page_count']} стр.")
+                lines.append(f"{icons.get(b['status'],'?')} {b['id']}. {b['title']} - {b['page_count']} стр.")
             lines.append("\nУдалить: <code>Книга удалить ID</code>")
-            text = "\n".join(lines)
-        await query.edit_message_text(text, parse_mode="HTML",
-                                       reply_markup=_back_keyboard())
+            t = "\n".join(lines)
+        await query.edit_message_text(t, parse_mode="HTML", reply_markup=back_kb)
         return True
 
-    if data == "admin:banlist":
-        banlist = await db.get_banlist()
-        if not banlist:
-            text = "🚫 Банлист пуст."
+    if action == "banlist":
+        bl = await db.get_banlist()
+        if not bl:
+            t = "🚫 Банлист пуст."
         else:
             lines = ["🚫 <b>Банлист:</b>\n"]
-            for b in banlist[:15]:
-                uname = f"@{b['username']}" if b["username"] else f"id{b['user_id']}"
-                lines.append(f"• {uname} — {b['reason'] or '?'}")
-            text = "\n".join(lines)
-        await query.edit_message_text(text, parse_mode="HTML",
-                                       reply_markup=_back_keyboard())
+            for b in bl[:15]:
+                u = f"@{b['username']}" if b["username"] else f"id{b['user_id']}"
+                lines.append(f"• {u} - {b['reason'] or '?'}")
+            t = "\n".join(lines)
+        await query.edit_message_text(t, parse_mode="HTML", reply_markup=back_kb)
         return True
 
-    if data == "admin:stats":
+    if action == "stats":
         from stats import get_chat_stats
-        text = await get_chat_stats()
-        await query.edit_message_text(text, parse_mode="HTML",
-                                       reply_markup=_back_keyboard())
+        await query.edit_message_text(
+            await get_chat_stats(), parse_mode="HTML", reply_markup=back_kb
+        )
         return True
 
-    if data == "admin:blitz_start":
+    if action == "admins" and is_owner:
+        mods = await db.get_all_moderators()
+        if not mods:
+            t = "👮 Администраторов нет.\n\nДобавить: <code>+Админ @username</code>"
+        else:
+            lines = ["👮 <b>Администраторы:</b>\n"]
+            for m in mods:
+                u = f"@{m['username']}" if m["username"] else m["full_name"]
+                lines.append(f"• {u} - ранг {m['rank']}")
+            lines.append("\nДобавить: <code>+Админ @username</code>")
+            lines.append("Снять: <code>-Админ @username</code>")
+            t = "\n".join(lines)
+        await query.edit_message_text(t, parse_mode="HTML", reply_markup=back_kb)
+        return True
+
+    if action == "logs" and is_owner:
+        logs = await db.get_logs(limit=10)
+        await query.edit_message_text(
+            "📜 Последние 10 действий\n(для полных логов пишите: Логи)",
+            parse_mode="HTML", reply_markup=back_kb
+        )
+        await _send_logs(bot, user_id, logs)
+        return True
+
+    if action == "blitz_start":
         from quiz import start_blitz
         await query.edit_message_text("⚡ Запускаю блиц...", parse_mode="HTML")
         await start_blitz(bot)
         return True
 
-    if data == "admin:blitz_stop":
+    if action == "blitz_stop":
         from quiz import stop_blitz
         await stop_blitz(bot)
         await query.edit_message_text("🛑 Блиц остановлен.", parse_mode="HTML")
         return True
 
-    if data == "admin:back":
-        await query.edit_message_text(
-            "⚙️ <b>Панель управления Касым-ботом</b>\n\nВыберите раздел:",
-            parse_mode="HTML",
-            reply_markup=main_menu_keyboard()
-        )
-        return True
-
     return False
 
 
-def _back_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("◀️ Назад", callback_data="admin:back")]
-    ])
-
-
 # ══════════════════════════════════════════════════════════════════
-# VIOLATION CALLBACKS
+# VIOLATION BUTTON CALLBACKS
 # ══════════════════════════════════════════════════════════════════
 
 async def handle_violation_callback(update: Update, bot: Bot) -> bool:
-    """Handle viol:action:id callbacks from owner."""
     query = update.callback_query
     if not query or query.from_user.id != OWNER_ID:
         return False
 
-    cb = query.data
-    if not cb.startswith("viol:"):
+    data = query.data
+    if not data.startswith("viol:"):
         return False
 
     await query.answer()
-    parts = cb.split(":")
+    parts = data.split(":")
     if len(parts) != 3:
         return False
 
-    _, action, violation_id_str = parts
-    violation_id = int(violation_id_str)
+    _, action, vid_str = parts
+    vid = int(vid_str)
 
     from moderation import process_owner_decision
-    result = await process_owner_decision(bot, violation_id, action)
+    result = await process_owner_decision(bot, vid, action)
 
-    if action == "restrict" and "restrict_apply" in result:
-        # Need duration input
-        set_owner_state("await_restrict_duration", {"violation_id": violation_id})
+    if "restrict_apply" in result:
+        set_state(OWNER_ID, "await_restrict_duration", {"violation_id": vid})
         await query.edit_message_text(
             "⏱ <b>На сколько ограничить?</b>\n\n"
-            "Напишите время:\n• 10 минут\n• 2 часа\n• 1 день\n• 50 дней\n• навсегда",
+            "Напишите:\n• 10 минут\n• 2 часа\n• 1 день\n• навсегда",
             parse_mode="HTML"
         )
     else:
@@ -488,27 +515,18 @@ async def handle_violation_callback(update: Update, bot: Bot) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════
-# HELPERS
+# RESOLVE USER
 # ══════════════════════════════════════════════════════════════════
 
 async def _resolve_user(text: str) -> tuple[int | None, str, str]:
-    """Try to find user by @username or ID string."""
     text = text.strip().lstrip("@")
     if text.isdigit():
-        uid = int(text)
+        uid  = int(text)
         user = await db.get_user(uid)
         if user:
             return uid, user["username"] or "", user["full_name"] or ""
         return uid, "", f"id{uid}"
-
-    # search by username
-    import aiosqlite
-    async with aiosqlite.connect("kasym.db") as d:
-        d.row_factory = aiosqlite.Row
-        async with d.execute(
-            "SELECT * FROM users WHERE LOWER(username)=?", (text.lower(),)
-        ) as cur:
-            row = await cur.fetchone()
-            if row:
-                return row["user_id"], row["username"] or "", row["full_name"] or ""
+    user = await db.get_user_by_username(text)
+    if user:
+        return user["user_id"], user["username"] or "", user["full_name"] or ""
     return None, "", ""
