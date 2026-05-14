@@ -21,7 +21,7 @@ async def transcribe_voice(bot: Bot, message: Message) -> str | None:
     Returns transcript text or None on failure.
     """
     if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
-        logger.warning("OpenAI not configured — skipping voice transcription")
+        logger.warning("OpenAI not configured - skipping voice transcription")
         return None
 
     file_obj = message.voice or message.video_note
@@ -62,10 +62,10 @@ def check_voice_transcript(transcript: str) -> tuple[bool, str]:
     """
     found_bad, word = contains_bad_words(transcript)
     if found_bad:
-        return True, "нецензурная лексика в голосовом"
+        return True, "Ð½ÐµÑÐµÐ½Ð·ÑÑÐ½Ð°Ñ Ð»ÐµÐºÑÐ¸ÐºÐ° Ð² Ð³Ð¾Ð»Ð¾ÑÐ¾Ð²Ð¾Ð¼"
 
     found_adult, kw = contains_adult_content(transcript)
     if found_adult:
-        return True, "контент 18+ в голосовом"
+        return True, "ÐºÐ¾Ð½ÑÐµÐ½Ñ 18+ Ð² Ð³Ð¾Ð»Ð¾ÑÐ¾Ð²Ð¾Ð¼"
 
     return False, ""
