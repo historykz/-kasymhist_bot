@@ -41,7 +41,7 @@ async def start_blitz(bot: Bot) -> bool:
     if not q_data:
         await bot.send_message(
             MAIN_CHAT_ID,
-            "📚 Хм, вопросов пока нет. Сначала загрузите книги — и летопись откроется 😄"
+            "📚 Хм, вопросов пока нет. Сначала загрузите книги - и летопись откроется 😄"
         )
         return False
 
@@ -173,15 +173,15 @@ async def process_blitz_answer(bot: Bot, user_id: int, username: str,
             ]
             await bot.send_message(MAIN_CHAT_ID, random.choice(responses), parse_mode="HTML")
 
-            # Close blitz — 2 correct answers reached
+            # Close blitz - 2 correct answers reached
             await _close_blitz_successfully(bot, session_id)
 
         else:
-            # Third+ correct — too late
+            # Third+ correct - too late
             await db.add_xp(user_id, XP_PARTICIPATE)
             responses = [
                 f"{mention}, верно, но зачёт уже закрыт 😄 Первые два батыра уже в летописи.",
-                f"{mention}, правильно! Но опоздал — два героя уже забрали баллы 📜",
+                f"{mention}, правильно! Но опоздал - два героя уже забрали баллы 📜",
             ]
             await bot.send_message(MAIN_CHAT_ID, random.choice(responses), parse_mode="HTML")
 
@@ -217,7 +217,7 @@ async def process_blitz_answer(bot: Bot, user_id: int, username: str,
 
         responses = [
             f"Ай-ай-ай, {mention} 😄 Ответ не тот. Повтори тему: <b>{topic}</b>. История любит точность!",
-            f"{mention}, не совсем 😄 Летопись плачет. Тема: <b>{topic}</b> — повторяй!",
+            f"{mention}, не совсем 😄 Летопись плачет. Тема: <b>{topic}</b> - повторяй!",
             f"Хм, {mention}, подумай ещё 🤔 Тема: <b>{topic}</b>",
         ]
         await bot.send_message(MAIN_CHAT_ID, random.choice(responses), parse_mode="HTML")
