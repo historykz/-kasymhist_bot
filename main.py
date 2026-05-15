@@ -1,8 +1,3 @@
-"""
-Касым-бот — учебный помощник по Истории Казахстана.
-Работает ТОЛЬКО в одном чате: MAIN_CHAT_ID.
-“””
-
 import asyncio
 import logging
 import re
